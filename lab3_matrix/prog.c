@@ -207,7 +207,7 @@ void* SigHandler(void* arg)
 void* ColumnHandler(void* arg)
 {
     argsMutex_t *args = arg;
-    int signo;
+    int signo, column;
     for(;;)
     {
         if(sigwait(args->mask, &signo)) ERR("sigwait");
@@ -217,15 +217,18 @@ void* ColumnHandler(void* arg)
                 break;
             case SIGQUIT:
                 pthread_mutex_lock(args->pmxNumber);
+                column = *(args->colNum);
+                pthread_mutex_unlock(args->pmxNumber);
+                
                 pthread_mutex_lock(args->pmxMatrix);
                 for(int i=0; i<args->width; i++)
                 {
-                    args->matrix[i][*(args->colNum)]++;
+                    args->matrix[i][column]++;
                 }
                 printf("\n");
                 PrintMatrix(args->matrix, args->heigth, args->width);
                 pthread_mutex_unlock(args->pmxMatrix);
-                pthread_mutex_unlock(args->pmxNumber);
+                
                 break;
             case SIGUSR1:
                 return NULL;
@@ -240,7 +243,7 @@ void* ColumnHandler(void* arg)
 void* RowHandler(void* arg)
 {
     argsMutex_t *args = arg;
-    int signo;
+    int signo, row;
     for(;;)
     {
         if(sigwait(args->mask, &signo)) ERR("sigwait");
@@ -248,16 +251,17 @@ void* RowHandler(void* arg)
         {
             case SIGINT:
                 pthread_mutex_lock(args->pmxNumber);
+                row = *(args->rowNum);
+                pthread_mutex_unlock(args->pmxNumber);
+
                 pthread_mutex_lock(args->pmxMatrix);
-                
                 for(int i=0; i<args->heigth; i++)
                 {
-                    args->matrix[*(args->rowNum)][i]++;
+                    args->matrix[row][i]++;
                 }
                 printf("\n");
                 PrintMatrix(args->matrix, args->heigth, args->width);
                 pthread_mutex_unlock(args->pmxMatrix);
-                pthread_mutex_unlock(args->pmxNumber);
                 break;
             case SIGQUIT:
                 break;
