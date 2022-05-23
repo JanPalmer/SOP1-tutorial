@@ -1,176 +1,273 @@
-#include <stddef.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
+#define _GNU_SOURCE
+#include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
-#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <arpa/inet.h>
 
-#define UINT unsigned int
-#define ERR(source) (perror(source),\
-                    fprintf(stderr, "%s:%d\n", __FILE__, __LINE__),\
-                    exit(EXIT_FAILURE))
+#define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
 
-typedef struct cell
+#define BACKLOG 3
+#define CHUNKSIZE 500
+#define NMMAX 30
+#define THREAD_NUM 3
+#define BUFSIZE 40
+volatile sig_atomic_t dowork = 1;
+
+typedef struct arguments {
+	int socket;
+	int lead;
+	pthread_cond_t *cond;
+    pthread_barrier_t *bar;
+    int pair_id;
+    pthread_mutex_t* pMutex;
+	int* ShouldClose;
+	sem_t* semaphore;
+} thread_arg;
+
+void usage(char *name)
 {
-    int Val;
-    pthread_mutex_t mx;
-} cell_t;
-
-typedef struct argsWork
-{
-    int ThrNum;
-    pthread_t tid;
-    int W;
-    int N;
-    cell_t *tab;
-} argsWork_t;
-
-struct mut
-{
-    pthread_mutex_t *mx1;
-    pthread_mutex_t *mx2;
-};
-
-void ReadArguments(int argc, char** argv, int *_N, int *_T, int *_W);
-void* thread_work(void* arg);
-void cellTableInit(cell_t *_t, int len);
-void UnlockMutex(void* arg);
-void swap(int* a, int* b);
-void msleep(UINT milisec);
-
-int main(int argc, char** argv)
-{
-    int N, T, W;
-    ReadArguments(argc, argv, &N, &T, &W);
-    argsWork_t threads[T];
-    cell_t table[N];
-    for(int i=0; i<N; i++) 
-    {
-        table[i].Val = N-1-i;
-        pthread_mutex_init(&table[i].mx, NULL);
-    }
-
-    for(int i=0; i<T; i++)
-    {
-        if(pthread_create(&threads[i].tid, NULL, thread_work, &threads[i])) ERR("pthread_create");
-        threads[i].ThrNum = i;
-        threads[i].W = W;
-        threads[i].N = N;
-        threads[i].tab = table;
-    }
-
-    msleep(5000);
-    for(int i=0; i<T; i++)
-    {
-        pthread_cancel(threads[i].tid);
-    }
-    //printf("Threads cancelled\n");
-    for(int i=0; i<T; i++)
-    {
-        //printf("[%lu] Joining\n", threads[i].tid);
-        if(pthread_join(threads[i].tid, NULL)) ERR("pthread_join");
-        //printf("[%lu] Joined\n", threads[i].tid);
-    }
-
-    for(int i=0; i<N; i++) 
-    {
-        printf("%d ", table[i].Val);
-        pthread_mutex_destroy(&table[i].mx);
-    }
-    printf("\n");
-
-    return EXIT_SUCCESS;
+	fprintf(stderr, "USAGE: %s port limit\n", name);
+	exit(EXIT_FAILURE);
 }
 
-void ReadArguments(int argc, char** argv, int *_N, int *_T, int *_W)
+int make_socket(int domain, int type)
 {
-    if(argc < 4) ERR("usage");
-
-    *_N = atoi(argv[1]);
-    *_T = atoi(argv[2]);
-    *_W = atoi(argv[3]);
-
-    if(*_N < 5 || *_N > 20) ERR("Wrong N argument");
-    if(*_T < 2 || *_T > 40) ERR("Wrong T argument");
-    if(*_W < 10 || *_W > 1000) ERR("Wrong W argument");
-    return;
+	int sock;
+	sock = socket(domain, type, 0);
+	if (sock < 0)
+		ERR("socket");
+	return sock;
 }
 
-void* thread_work(void* arg)
+struct sockaddr_in make_address(char *address, char *port)
 {
-    argsWork_t* args = (argsWork_t*) arg;
-    UINT seed = pthread_self();
-    int time;
-    int index;
-    while(1)
-    {
-        time = rand_r(&seed)%(args->W - 5 + 1) + 5;
-        msleep(time);
-        index = rand_r(&seed)%args->N;
-        struct mut* temp = malloc(sizeof(struct mut));
-        if(temp == NULL) ERR("malloc");
-        if(index == args->N-1)
-        {
-            temp->mx1 = &args->tab[0].mx;
-            temp->mx2 = &args->tab[index].mx;
-            pthread_cleanup_push(UnlockMutex, temp);
-            pthread_mutex_lock(&args->tab[0].mx);
-            msleep(200);
-            pthread_mutex_lock(&args->tab[index].mx);
-            if(args->tab[index].Val < args->tab[0].Val) swap(&args->tab[index].Val, &args->tab[0].Val);
-            pthread_cleanup_pop(1);
+	int ret;
+	struct sockaddr_in addr;
+	struct addrinfo *result;
+	struct addrinfo hints = {};
+	hints.ai_family = AF_INET;
+	if ((ret = getaddrinfo(address, port, &hints, &result))) {
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
+		exit(EXIT_FAILURE);
+	}
+	addr = *(struct sockaddr_in *)(result->ai_addr);
+	freeaddrinfo(result);
+	return addr;
+}
 
+int bind_tcp_socket(char *address, char * port)
+{
+	struct sockaddr_in addr;
+	int socketfd, t = 1;
+	socketfd = make_socket(PF_INET, SOCK_STREAM);
+	memset(&addr, 0x00, sizeof(struct sockaddr_in));
+    addr = make_address(address, port);
+	// addr.sin_family = AF_INET;
+	// addr.sin_port = htons(atoi(port));
+	// addr.sin_addr.s_addr = 
+	if (setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &t, sizeof(t)))
+		ERR("setsockopt");
+	if (bind(socketfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+		ERR("bind");
+	if (listen(socketfd, BACKLOG) < 0)
+		ERR("listen");
+	return socketfd;
+}
+
+int add_new_client(int sfd)
+{
+	int nfd;
+	if ((nfd = TEMP_FAILURE_RETRY(accept(sfd, NULL, NULL))) < 0) {
+		if (EAGAIN == errno || EWOULDBLOCK == errno)
+			return -1;
+		ERR("accept");
+	}
+	return nfd;
+}
+
+void* threadfunc(void *arg)
+{
+    char buf[BUFSIZE];
+    // socklen_t size = sizeof(struct sockaddr_in);
+	thread_arg* targ = (thread_arg*) arg;
+	memset(buf, 0, BUFSIZE);
+	sprintf(buf, "Waiting in pair [%d], lead: [%d]\n", targ->pair_id, targ->lead);
+	send(targ->socket, buf, BUFSIZE, 0);
+	printf("%s", buf);
+
+    pthread_barrier_wait(targ->bar);
+    int recv_return;
+
+    while(targ->ShouldClose)
+    {
+        memset(buf,0, BUFSIZE);
+        recv_return = recv(targ->socket, buf, BUFSIZE, 0);
+        if (recv_return < 0) {
+		    if (errno == EINTR) continue;
+            ERR("recvfrom:");
         }
-        else
-        {
-            temp->mx1 = &args->tab[index].mx;
-            temp->mx2 = &args->tab[index+1].mx;
-            pthread_cleanup_push(UnlockMutex, temp);
-            pthread_mutex_lock(&args->tab[index].mx);
-            msleep(200);
-            pthread_mutex_lock(&args->tab[index+1].mx);
-            if(args->tab[index].Val > args->tab[index+1].Val) swap(&args->tab[index].Val, &args->tab[index+1].Val);
-            pthread_cleanup_pop(1);
+        if(recv_return == 0){
+            printf("[%d] Pair: [%d] Other client left, ending\n", gettid(), targ->pair_id);
+			*(targ->ShouldClose) = 0;
+            break;
+        }
+
+        if(strcmp(buf,"") == 0) break;
+        printf("Got: %s",buf);
+        if(strcmp(buf,"stand\r\n") == 0){
+            printf("[%d] stand. Ending\n", gettid());
+            break;            
+        }
+        if(strcmp(buf,"hit") == 0){
+            printf("[%d] hit\n", gettid());
+            continue;
         } 
     }
-    return NULL;
-}
 
-void UnlockMutex(void* arg)
-{
-    struct mut* args = (struct mut*) arg;
-    pthread_mutex_unlock(args->mx1);
-    pthread_mutex_unlock(args->mx2);
-    free(args);
-    return;
-}
+	pthread_barrier_wait(targ->bar);
 
-void cellTableInit(cell_t *_t, int len)
-{
-    for(int i=0; i<len; i++) 
+	printf("Pair [%d] ending\n", targ->pair_id);
+
+	sem_post(targ->semaphore);
+	if(targ->lead == 0){
+		shutdown(targ->socket, SHUT_RDWR);
+		close(targ->socket);
+		free(targ);
+		return NULL;
+	}
+
+    if(pthread_barrier_destroy(targ->bar) < 0)
     {
-        _t[i].Val = len-1-i;
-        pthread_mutex_init(&_t[i].mx, NULL);
+        if(errno != EINVAL)
+        ERR("pthread_barrier_destroy");
     }
+    if(pthread_cond_destroy(targ->cond) != 0) ERR("cond_destroy");
+
+	shutdown(targ->socket, SHUT_RDWR);
+	close(targ->socket);
+	//int semvalue;
+	// sem_getvalue(targ->semaphore, &semvalue);
+	// printf("Clients left: %d", semvalue);
+	//sem_post(targ->semaphore);
+	free(targ->ShouldClose);
+	free(targ->bar);
+	free(targ->cond);
+	free(targ);
+	return NULL;
 }
 
-void swap(int* a, int* b)
+void doServer(int socket, int limit)
 {
-    int tmp = *a;
-    *a = *b;
-    *b = tmp;
-    return;
+    int clientSocket;
+    int pairs = 0;
+    int pair_id = -1;
+	int16_t deny = -1;
+	deny = htons(deny);
+	pthread_t thread;
+    pthread_barrier_t* bars;
+    pthread_cond_t* condtmp;
+	int* sharedClose;
+	char tmpbuf[BUFSIZE];
+	memset(tmpbuf, 0, BUFSIZE);
+	strcpy(tmpbuf, "Too many clients\n");
+
+	struct arguments *args;
+	sem_t semaphore;
+	if (sem_init(&semaphore, 0, limit) != 0)
+		ERR("sem_init");
+	while (dowork) {
+        if ((clientSocket = add_new_client(socket)) == -1)
+			continue;
+        if (TEMP_FAILURE_RETRY(sem_trywait(&semaphore)) == -1) {
+			switch (errno) {
+			case EAGAIN:
+				send(clientSocket, tmpbuf, BUFSIZE, 0);
+                close(clientSocket);
+			case EINTR:
+				continue;
+			}
+			ERR("sem_wait");
+		}
+
+        if(pairs == 0)
+        {
+            pair_id++;
+            pairs = (pairs + 1) % 2;
+            
+            if((bars = (pthread_barrier_t *)malloc(sizeof(pthread_barrier_t))) == NULL) ERR("malloc");
+            pthread_barrier_init(bars, NULL, 2);
+
+            if((condtmp = (pthread_cond_t*)malloc(sizeof(pthread_cond_t))) == NULL) ERR("malloc cond");
+
+			if((sharedClose = (int*)malloc(sizeof(int))) == NULL) ERR("malloc int");
+			*sharedClose = 1;
+        }
+		else {
+		pairs = 0;
+		}
+
+        if((args = (thread_arg*)malloc(sizeof(thread_arg))) == NULL) ERR("malloc arg");
+
+		if ((args = (struct arguments *)malloc(sizeof(struct arguments))) == NULL)
+			ERR("malloc:");
+		args->socket = clientSocket;
+        args->pair_id = pair_id;
+        args->bar = bars;
+        args->cond = condtmp;
+		args->ShouldClose = sharedClose;
+		args->semaphore = &semaphore;
+		if(pairs == 0)
+			args->lead = 1;
+		else
+		 	args->lead = 0;
+        //args->addr = addr;
+        if (pthread_create(&thread, NULL, threadfunc, (void *)args) != 0)
+          ERR("pthread_create");
+        if (pthread_detach(thread) != 0)
+          ERR("pthread_detach");
+	}
+
+	sem_destroy(&semaphore);
 }
 
+int main(int argc, char **argv)
+{
+    int limit, socket, new_flags;
+    if (argc != 4)
+		usage("%s limit, address, port");
+    if((limit = atoi(argv[1])) <= 0){
+        usage("Inputted player count is less or equal 0");
+    }
 
-void msleep(UINT milisec) {
-    time_t sec= (int)(milisec/1000);
-    milisec = milisec - (sec*1000);
-    struct timespec req= {0};
-    req.tv_sec = sec;
-    req.tv_nsec = milisec * 1000000L;
-    if(nanosleep(&req,&req)) ERR("nanosleep");
+	// pthread_t* thread;
+    // if((thread = (pthread_t *)malloc(sizeof(pthread_t)*limit)) == NULL) ERR("malloc");
+	// thread_arg* targ;    
+    // if((targ = (thread_arg *)malloc(sizeof(thread_arg)*limit)) == NULL) ERR("malloc");
+
+	socket = bind_tcp_socket(argv[2], argv[3]);
+	new_flags = fcntl(socket, F_GETFL) | O_NONBLOCK;
+	if (fcntl(socket, F_SETFL, new_flags) == -1)    ERR("fcntl");
+    doServer(socket, limit);
+
+	// for (int i = 0; i < THREAD_NUM; i++)
+	// 	if (pthread_join(thread[i], NULL) != 0)
+	// 		ERR("pthread_join");
+	if (TEMP_FAILURE_RETRY(close(socket)) < 0)
+		ERR("close");
+    // free(thread);
+    // free(targ);
+	return EXIT_SUCCESS;
 }
